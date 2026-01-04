@@ -105,3 +105,57 @@ You can fine-tune the behavior at the top of `demo.py`:
 
 
 These chunks are then embedded and indexed for similarity-based retrieval in the RAG pipeline.
+
+# 🧠 Methodology: Advanced Hybrid Retrieval
+
+This RAG system implements a Hybrid Search architecture combined with Reciprocal Rank Fusion (RRF) to ensure the LLM receives the most relevant context possible.
+
+## 1. Hybrid Search Strategy
+
+Traditional search systems usually choose between keyword or semantic search. This project uses both in parallel to capture different types of relevance:
+
+- **Sparse Retrieval (BM25):** Focuses on lexical overlap. It treats the document as a "bag of words" and uses the BM25 (Best Matching 25) algorithm. This is critical for finding specific terms, technical IDs, or unique names (e.g., `Product-XYZ-123`).
+- **Dense Retrieval (Embeddings):** Focuses on semantic intent. It uses the `nomic-embed-text` model to convert text into a 768-dimensional vector space. This allows the system to find "car" even if the user typed "automobile."
+
+## 2. Reciprocal Rank Fusion (RRF)
+
+Merging scores from BM25 (which can be any positive number) and Cosine Similarity (which is 0.0 to 1.0) is mathematically difficult. This system utilizes RRF, a state-of-the-art ranking algorithm that ignores raw scores in favor of rank position.
+
+### The formula
+
+```text
+RRFscore(d) = sum_{r in R} w_r / (k + rank_r(d))
+```
+
+Or expressed in LaTeX form:
+
+$$
+\text{RRFscore}(d) = \sum_{r \in R} \frac{w_r}{k + \text{rank}_r(d)}
+$$
+
+Where:
+- `R`: The set of retrieval methods (BM25 and Vector).
+- `rank_r(d)`: The position of document `d` in list `r` (1-indexed).
+- `k`: A constant (set to `60`) that prevents the top-ranked results from dominating the fusion too heavily.
+- `w_r`: The weight applied to the specific retrieval method (defined by `ALPHA_EMB` and `BETA_BM25`).
+
+## 3. NLP Normalization Pipeline
+
+To improve the accuracy of the BM25 lexical engine, the system processes both the query and the document chunks through a spaCy pipeline:
+
+- **Lowercasing:** Standardizes all text.
+- **Lemmatization:** Reduces words to their base form (e.g., "running" → "run").
+- **Noise Removal:** Filters out stopwords (the, is, at), punctuation, and extra whitespace.
+
+This ensures that a search for "cats" will successfully match a document containing the word "cat."
+
+## 4. Generation & Grounding
+
+Once the top `K` chunks are fused, they are injected into the LLM system prompt. We implement strict grounding instructions:
+
+- The model is instructed to answer **ONLY** using the provided context.
+- If the information is missing, the model is forced to admit it doesn't know rather than hallucinating.
+
+---
+
+Constants referenced: `ALPHA_EMB` (embedding weight), `BETA_BM25` (BM25 weight), and `K` (number of fused chunks).
