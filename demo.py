@@ -1,13 +1,3 @@
-# demo.py
-# RAG chatbot with:
-# - chunking (blocks -> chunks with overlap)
-# - embeddings retrieval (Ollama)
-# - NLP normalization (spaCy)
-# - hybrid retrieval (Embeddings + BM25)
-# - robust streaming output
-#
-# Run: python demo.py
-
 from __future__ import annotations
 
 import re
@@ -18,14 +8,12 @@ from typing import List, Tuple, Dict, Any
 import numpy as np
 import ollama
 from rank_bm25 import BM25Okapi
-
 import spacy
 
-
 # ----------------------------
-# Config (EDIT THESE)
+# Config
 # ----------------------------
-FILE_PATH = Path(__file__).with_name("cat.txt")  # put cat.txt next to demo.py or set absolute path
+FILE_PATH = Path(__file__).with_name("cat.txt")
 INDEX_PATH = Path(__file__).with_name("cat_index.pkl")
 
 EMBED_MODEL = "nomic-embed-text"
@@ -35,309 +23,198 @@ MAX_WORDS = 200
 OVERLAP_WORDS = 40
 TOP_K = 5
 
-# Hybrid retrieval weighting (tune if needed)
-ALPHA_EMB = 0.7   # weight for embedding similarity
-BETA_BM25 = 0.3   # weight for BM25 lexical score
-
+# RRF Configuration
+K_RRF = 60         # Smoothing constant (Standard value)
+ALPHA_EMB = 0.7    # Weight for Semantic Search (Embeddings)
+BETA_BM25 = 0.3    # Weight for Lexical Search (BM25)
 
 # ----------------------------
 # spaCy NLP setup
 # ----------------------------
 def load_spacy() -> spacy.language.Language:
-    # Disable components we don't need for speed
     try:
-        nlp = spacy.load("en_core_web_sm", disable=["ner", "parser", "textcat"])
-    except OSError as e:
+        # Disable unused components for performance
+        return spacy.load("en_core_web_sm", disable=["ner", "parser", "textcat"])
+    except OSError:
         raise RuntimeError(
-            "spaCy model not found.\n"
-            "Run:\n  python -m spacy download en_core_web_sm"
-        ) from e
-    return nlp
+            "spaCy model not found. Run: python -m spacy download en_core_web_sm"
+        )
 
 NLP = load_spacy()
 
-
 def normalize_for_search(text: str) -> List[str]:
-    """
-    NLP normalization for lexical search:
-    - lowercase
-    - lemmatize
-    - remove stopwords/punct/space
-    Returns token list suitable for BM25.
-    """
+    """Lemmatizes and removes noise for lexical matching."""
     doc = NLP(text.lower())
-    toks = []
-    for t in doc:
-        if t.is_stop or t.is_punct or t.is_space:
-            continue
-        lemma = t.lemma_.strip()
-        if lemma:
-            toks.append(lemma)
-    return toks
-
+    return [
+        t.lemma_.strip() for t in doc 
+        if not (t.is_stop or t.is_punct or t.is_space) and t.lemma_.strip()
+    ]
 
 # ----------------------------
-# Text loading + chunking
+# Text loading + Chunking
 # ----------------------------
 def load_text(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="ignore")
 
-
-def split_into_line_blocks(text: str) -> List[str]:
-    lines = [ln.strip() for ln in text.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
-    return [ln for ln in lines if ln]
-
-
-def split_into_paragraph_blocks(text: str) -> List[str]:
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    text = re.sub(r"\n\s*\n+", "\n\n", text.strip())
-    blocks = [re.sub(r"\s+", " ", b).strip() for b in text.split("\n\n")]
-    return [b for b in blocks if b]
-
+def split_into_blocks(text: str) -> List[str]:
+    """Splits raw text into meaningful blocks (paragraphs or lines)."""
+    lines = text.replace("\r\n", "\n").split("\n")
+    blank_ratio = sum(1 for ln in lines if not ln.strip()) / max(len(lines), 1)
+    
+    if blank_ratio > 0.05:
+        # Paragraph-based
+        text = re.sub(r"\n\s*\n+", "\n\n", text.strip())
+        return [re.sub(r"\s+", " ", b).strip() for b in text.split("\n\n") if b.strip()]
+    else:
+        # Line-based
+        return [ln.strip() for ln in lines if ln.strip()]
 
 def chunk_blocks(blocks: List[str], max_words: int, overlap_words: int) -> List[str]:
-    chunks: List[str] = []
-    cur_words: List[str] = []
+    """Combines blocks into chunks of specific word length with overlap."""
+    chunks, cur_words = [], []
     cur_len = 0
 
     for block in blocks:
         bw = block.split()
-        b_len = len(bw)
-
-        # Oversized block -> split by words with overlap
-        if b_len > max_words:
-            if cur_words:
-                chunks.append(" ".join(cur_words))
-                cur_words, cur_len = [], 0
-
+        if len(bw) > max_words:
+            if cur_words: chunks.append(" ".join(cur_words))
             start = 0
-            while start < b_len:
-                end = min(start + max_words, b_len)
+            while start < len(bw):
+                end = min(start + max_words, len(bw))
                 chunks.append(" ".join(bw[start:end]))
                 start = max(0, end - overlap_words)
+            cur_words, cur_len = [], 0
             continue
 
-        # Flush if adding exceeds budget
-        if cur_words and (cur_len + b_len > max_words):
+        if cur_words and (cur_len + len(bw) > max_words):
             chunks.append(" ".join(cur_words))
-            if overlap_words > 0:
-                cur_words = cur_words[-overlap_words:]
-                cur_len = len(cur_words)
-            else:
-                cur_words, cur_len = [], 0
+            cur_words = cur_words[-overlap_words:] if overlap_words > 0 else []
+            cur_len = len(cur_words)
 
         cur_words.extend(bw)
-        cur_len += b_len
+        cur_len += len(bw)
 
-    if cur_words:
-        chunks.append(" ".join(cur_words))
-
+    if cur_words: chunks.append(" ".join(cur_words))
     return chunks
-
-
-def build_chunks(file_path: Path) -> List[str]:
-    text = load_text(file_path)
-
-    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-    blank = sum(1 for ln in lines if not ln.strip())
-    use_lines = blank < max(3, int(0.02 * len(lines)))
-
-    blocks = split_into_line_blocks(text) if use_lines else split_into_paragraph_blocks(text)
-    chunks = chunk_blocks(blocks, max_words=MAX_WORDS, overlap_words=OVERLAP_WORDS)
-
-    if not chunks:
-        raise ValueError("No chunks produced. Check that the input file is not empty.")
-
-    print(f"Detected format: {'line-based' if use_lines else 'paragraph-based'}")
-    print(f"Blocks: {len(blocks)} | Chunks: {len(chunks)}")
-    return chunks
-
 
 # ----------------------------
-# Embeddings + indexing
+# Embeddings & Indexing
 # ----------------------------
 def embed_one(text: str) -> np.ndarray:
-    try:
-        resp = ollama.embeddings(model=EMBED_MODEL, prompt=text)
-    except ollama._types.ResponseError as e:
-        if "not found" in str(e).lower():
-            raise RuntimeError(
-                f'Embedding model "{EMBED_MODEL}" not found.\n'
-                f"Run: ollama pull {EMBED_MODEL}\n"
-                f"Or set EMBED_MODEL to a model you have (see: ollama list)."
-            ) from e
-        raise
+    resp = ollama.embeddings(model=EMBED_MODEL, prompt=text)
     return np.array(resp["embedding"], dtype=np.float32)
-
-
-def normalize_rows(mat: np.ndarray) -> np.ndarray:
-    norms = np.linalg.norm(mat, axis=1, keepdims=True)
-    norms = np.clip(norms, 1e-12, None)
-    return mat / norms
-
 
 def ensure_index(file_path: Path) -> Dict[str, Any]:
     stat = file_path.stat()
-    meta_now = {
-        "file_path": str(file_path),
-        "mtime": stat.st_mtime,
-        "size": stat.st_size,
-        "embed_model": EMBED_MODEL,
-        "max_words": MAX_WORDS,
-        "overlap_words": OVERLAP_WORDS,
-    }
+    meta_now = {"mtime": stat.st_mtime, "size": stat.st_size, "model": EMBED_MODEL}
 
     if INDEX_PATH.exists():
-        try:
-            with INDEX_PATH.open("rb") as f:
-                idx = pickle.load(f)
-            if idx.get("meta") == meta_now:
-                return idx
-        except Exception:
-            pass  # rebuild if corrupted
+        with INDEX_PATH.open("rb") as f:
+            idx = pickle.load(f)
+            if idx.get("meta") == meta_now: return idx
 
-    chunks = build_chunks(file_path)
+    print(f"Indexing {file_path}... this might take a moment.")
+    chunks = chunk_blocks(split_into_blocks(load_text(file_path)), MAX_WORDS, OVERLAP_WORDS)
+    
+    emb_list = [embed_one(ch) for ch in chunks]
+    emb_matrix = np.vstack(emb_list)
+    
+    # Normalize for cosine similarity calculation
+    norms = np.linalg.norm(emb_matrix, axis=1, keepdims=True)
+    emb_matrix = emb_matrix / np.clip(norms, 1e-12, None)
 
-    # Embeddings
-    emb_list: List[np.ndarray] = []
-    for i, ch in enumerate(chunks, start=1):
-        emb_list.append(embed_one(ch))
-        if i % 50 == 0 or i == len(chunks):
-            print(f"Embedded {i}/{len(chunks)} chunks...")
-
-    emb = normalize_rows(np.vstack(emb_list))
-
-    # NLP tokens for BM25 (lexical index)
     tokenized = [normalize_for_search(ch) for ch in chunks]
     bm25 = BM25Okapi(tokenized)
 
-    idx = {
-        "chunks": chunks,
-        "emb": emb,
-        "bm25": bm25,
-        "bm25_tokens": tokenized,  # kept for debugging/inspection
-        "meta": meta_now,
-    }
-
+    idx = {"chunks": chunks, "emb": emb_matrix, "bm25": bm25, "meta": meta_now}
     with INDEX_PATH.open("wb") as f:
         pickle.dump(idx, f)
-
     return idx
 
-
 # ----------------------------
-# Hybrid retrieval (Embeddings + BM25)
+# Hybrid Retrieval (RRF)
 # ----------------------------
-def minmax(x: np.ndarray) -> np.ndarray:
-    if x.size == 0:
-        return x
-    xmin, xmax = float(x.min()), float(x.max())
-    if abs(xmax - xmin) < 1e-12:
-        return np.zeros_like(x)
-    return (x - xmin) / (xmax - xmin)
-
-
-def retrieve(index: Dict[str, Any], query: str, top_k: int = TOP_K) -> List[Tuple[str, float, float, float]]:
+def retrieve(index: Dict[str, Any], query: str, top_k: int = TOP_K) -> List[Tuple[str, float]]:
     """
-    Returns list of (chunk, final_score, emb_score, bm25_score).
+    Combines Embedding and BM25 ranks using Reciprocal Rank Fusion.
     """
-    # Embedding similarity
+    # 1. Semantic Scores (Cosine Similarity)
     qv = embed_one(query)
     qv = qv / max(np.linalg.norm(qv), 1e-12)
-    emb_sims = index["emb"] @ qv  # cosine sims
+    emb_sims = index["emb"] @ qv
+    emb_ranks = np.argsort(-emb_sims)  # Indices of highest similarity first
 
-    # BM25 lexical score
+    # 2. Lexical Scores (BM25)
     q_tokens = normalize_for_search(query)
     bm25_scores = np.array(index["bm25"].get_scores(q_tokens), dtype=np.float32)
+    bm25_ranks = np.argsort(-bm25_scores) # Indices of highest lexical score first
 
-    # Normalize + combine
-    emb_n = minmax(emb_sims.astype(np.float32))
-    bm25_n = minmax(bm25_scores)
+    # 3. RRF Calculation
+    # RRF Score = Sum ( Weight / (K_RRF + Rank) )
+    rrf_map: Dict[int, float] = {}
 
-    final = ALPHA_EMB * emb_n + BETA_BM25 * bm25_n
+    # Accumulate score from Embedding ranks
+    for rank, idx in enumerate(emb_ranks):
+        rrf_map[idx] = rrf_map.get(idx, 0) + ALPHA_EMB * (1.0 / (K_RRF + rank + 1))
 
-    k = min(top_k, final.shape[0])
-    top_idx = np.argpartition(-final, kth=k - 1)[:k]
-    top_idx = top_idx[np.argsort(-final[top_idx])]
+    # Accumulate score from BM25 ranks
+    for rank, idx in enumerate(bm25_ranks):
+        rrf_map[idx] = rrf_map.get(idx, 0) + BETA_BM25 * (1.0 / (K_RRF + rank + 1))
 
+    # 4. Final Sorting
+    sorted_indices = sorted(rrf_map.items(), key=lambda x: x[1], reverse=True)
+    
     results = []
-    for i in top_idx:
-        results.append((index["chunks"][i], float(final[i]), float(emb_sims[i]), float(bm25_scores[i])))
+    for i in range(min(top_k, len(sorted_indices))):
+        idx, score = sorted_indices[i]
+        results.append((index["chunks"][idx], score))
     return results
 
-
 # ----------------------------
-# Chat
+# Chat Logic
 # ----------------------------
-def build_system_prompt(retrieved: List[Tuple[str, float, float, float]]) -> str:
-    context = "\n".join([f"- {chunk}" for chunk, *_ in retrieved])
-    return (
-        "You are a helpful chatbot.\n"
-        "Use ONLY the context below to answer.\n"
-        "If the answer is not present, say \"I don't know based on the provided context.\".\n\n"
-        f"Context:\n{context}\n"
-    )
-
-
-def stream_chat(model: str, system_prompt: str, user_prompt: str) -> None:
+def stream_chat(system_prompt: str, user_prompt: str) -> None:
     stream = ollama.chat(
-        model=model,
+        model=LLM_MODEL,
         messages=[
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
+            {"role": "user", "content": user_prompt}
         ],
         stream=True,
     )
-
-    printed_any = False
     for part in stream:
-        content = ""
-        if isinstance(part, dict):
-            content = ((part.get("message") or {}).get("content") or part.get("response") or "")
-        else:
-            content = (
-                getattr(getattr(part, "message", None), "content", "")
-                or getattr(part, "response", "")
-                or ""
-            )
-
-        if content:
-            printed_any = True
-            print(content, end="", flush=True)
-
-    if not printed_any:
-        print("[No tokens returned from model stream]")
+        print(part['message']['content'], end="", flush=True)
     print()
-
 
 def main() -> None:
     if not FILE_PATH.exists():
-        raise FileNotFoundError(f"Missing file: {FILE_PATH}")
+        print(f"File not found: {FILE_PATH}. Please provide a cat.txt file."); return
 
-    print(f"Loading/building index for: {FILE_PATH}")
     index = ensure_index(FILE_PATH)
-    print(f"Ready. Total chunks: {len(index['chunks'])}\n")
+    print(f"Ready! Loaded {len(index['chunks'])} chunks.\n")
 
     while True:
-        q = input("Ask me a question (or 'exit'): ").strip()
-        if q.lower() in {"exit", "quit"}:
-            break
-        if not q:
-            continue
+        q = input("\nAsk a question (or 'exit'): ").strip()
+        if q.lower() in {"exit", "quit"}: break
+        if not q: continue
 
         hits = retrieve(index, q, top_k=TOP_K)
 
-        print("\nRetrieved knowledge (hybrid scoring):")
-        for chunk, final_s, emb_s, bm25_s in hits:
-            preview = chunk[:160].replace("\n", " ")
-            print(f" - final={final_s:.3f} | emb={emb_s:.3f} | bm25={bm25_s:.3f} | {preview}{'...' if len(chunk)>160 else ''}")
+        print("\n--- Retrieved Knowledge (RRF Scores) ---")
+        for chunk, score in hits:
+            # Displaying preview of the chunk
+            print(f"[{score:.5f}] {chunk[:100].replace('\n', ' ')}...")
 
-        system_prompt = build_system_prompt(hits)
+        context_text = "\n".join([f"- {c}" for c, _ in hits])
+        sys_prompt = (
+            "You are a helpful AI assistant. Use the following context to answer the question.\n"
+            "If the answer is not in the context, say you don't know based on the provided data.\n"
+            "Be concise and professional.\n\n"
+            f"Context:\n{context_text}"
+        )
 
-        print("\nChatbot response:")
-        stream_chat(LLM_MODEL, system_prompt, q)
-        print()
-
+        print("\n--- Assistant Response ---")
+        stream_chat(sys_prompt, q)
 
 if __name__ == "__main__":
     main()
