@@ -1,4 +1,4 @@
-# 🐾 Hybrid RAG Chatbot (RRF Optimized)
+# 🐾 RAG Chatbot
 
 This project is a local **Retrieval-Augmented Generation (RAG)** chatbot. It uses a **Hybrid Search** approach, combining semantic (vector) search and lexical (keyword) search, fused together using the **Reciprocal Rank Fusion (RRF)** algorithm for maximum accuracy.
 
