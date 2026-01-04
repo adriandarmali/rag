@@ -1,243 +1,180 @@
-# rag
-Basic RAG model using Ollama chatbot with NLP embedded.
+# Basic Retrieval-Augmented Generator (RAG) AI Model  
+**Adrian Darmali**
 
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Basic Retrieval Augmented Generator AI Model — README</title>
-  <style>
-    :root {
-      --max-width: 900px;
-      --accent: #0366d6;
-      --muted: #586069;
-      --bg: #ffffff;
-      --code-bg: #f6f8fa;
-      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, "Roboto Mono", "Courier New", monospace;
-    }
+---
 
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial;
-      color: #24292f;
-      background: #f7f8fa;
-      margin: 0;
-      padding: 32px;
-      display: flex;
-      justify-content: center;
-    }
+## Overview
+This project implements a basic **Retrieval-Augmented Generation (RAG)** pipeline using:
 
-    .container {
-      max-width: var(--max-width);
-      background: var(--bg);
-      padding: 36px;
-      border-radius: 8px;
-      box-shadow: 0 6px 18px rgba(35, 45, 60, 0.08);
-    }
+- A local text knowledge base (`cat.txt`)
+- Ollama for **embeddings** and **chat generation**
+- A lightweight, local “vector database” stored as a **pickle index**
+- Cosine similarity retrieval for top-K context selection
 
-    header h1 {
-      margin: 0 0 6px 0;
-      font-size: 28px;
-      line-height: 1.2;
-    }
+---
 
-    header p.author {
-      margin: 0 0 18px 0;
-      color: var(--muted);
-    }
+## End-to-End Methodology
 
-    h2 {
-      margin-top: 26px;
-      color: #111827;
-      border-bottom: 1px solid #e6edf3;
-      padding-bottom: 8px;
-    }
+### 1) Load the Source File
+- Read `cat.txt` from disk as raw text.
 
-    p, li {
-      line-height: 1.6;
-      margin: 8px 0;
-    }
+---
 
-    ul, ol {
-      margin: 8px 0 8px 20px;
-    }
+### 2) Preprocess & Chunk the Text
+#### Format Detection
+The pipeline detects the file structure:
 
-    pre {
-      background: var(--code-bg);
-      padding: 14px;
-      border-radius: 6px;
-      overflow: auto;
-      font-family: var(--mono);
-      font-size: 13px;
-      line-height: 1.45;
-      border: 1px solid #e1e4e8;
-    }
+- **Line-based (one fact per line)**  
+  If the file is mostly non-empty lines with few blank lines.
 
-    code {
-      font-family: var(--mono);
-      background: rgba(27,31,35,0.05);
-      padding: 0.15em 0.25em;
-      border-radius: 4px;
-      font-size: 0.95em;
-    }
+- **Paragraph-based (blank-line separated)**  
+  If the file contains blank lines separating blocks of text.
 
-    .note {
-      background: #fff8c6;
-      border: 1px solid #ffec99;
-      padding: 12px;
-      border-radius: 6px;
-      color: #5a4a00;
-      margin: 12px 0;
-    }
+#### Block Construction (Atomic Units)
+- Split the text into **blocks** based on detected format.
+- Blocks are treated as “atomic” to avoid splitting logical units.
 
-    footer {
-      margin-top: 28px;
-      color: var(--muted);
-      font-size: 13px;
-    }
+#### Chunk Construction (Size-Controlled)
+- Build chunks by **greedily packing blocks** into ~`MAX_WORDS` (e.g., ~200 words).
+- Add **overlap** between consecutive chunks (e.g., `OVERLAP_WORDS = 40`) to reduce boundary loss.
+- If a single block exceeds the max size, split it into multiple chunks with overlap.
 
-    .example {
-      background: #f1f8ff;
-      border-left: 4px solid var(--accent);
-      padding: 12px;
-      border-radius: 4px;
-      margin: 8px 0;
-    }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <header>
-      <h1>Basic Retrieval Augmented Generator AI Model</h1>
-      <p class="author">Adrian Darmali</p>
-    </header>
+---
 
-    <main>
-      <section>
-        <h2>Overview</h2>
-        <p>This project implements a simple Retrieval-Augmented Generation (RAG) pipeline. It converts source text into retrieval-ready chunks, builds embeddings for those chunks, and at query time retrieves the most relevant chunks to ground a generative model response.</p>
-      </section>
+### 3) Embed & Index the Chunks (Vector Database)
+- Generate an embedding vector for each chunk using an Ollama embedding model (e.g., `nomic-embed-text`).
+- **L2-normalize embeddings** so cosine similarity is efficient.
+- Persist `{chunks, embeddings, metadata}` locally using `pickle` as an on-disk vector index.
 
-      <section>
-        <h2>Pipeline</h2>
+---
 
-        <h3>Load the source file</h3>
-        <p>Read <code>cat.txt</code> from disk as raw text.</p>
+### 4) Query-Time Retrieval
+- Embed the user question using the same embedding model.
+- Compute **cosine similarity** between the query embedding and all chunk embeddings.
+- Return the **top-K** most similar chunks as retrieved context.
 
-        <h3>Preprocess + chunk the text</h3>
-        <p>Detect format:</p>
-        <ul>
-          <li>If the file is mostly non-empty lines with few blank lines → treat it as <strong>one-fact-per-line</strong>.</li>
-          <li>Otherwise → treat it as <strong>paragraph / blank-line separated content</strong>.</li>
-        </ul>
+---
 
-        <p>Split into blocks (atomic units) using the chosen format. Build chunks by greedily packing blocks up to a target size (e.g., ~200 words). Add overlap between consecutive chunks (e.g., 40 words) to preserve context across boundaries. If any single block exceeds the max size, split it into multiple chunks with overlap.</p>
+### 5) Answer Generation (Grounded Response)
+- Construct a system prompt that instructs the chatbot to:
+  - Use **only** the retrieved chunks
+  - Avoid making up new information
+- Call an Ollama chat model (e.g., `llama3.2`) with:
+  - **System message**: retrieved context + grounding rules
+  - **User message**: the question
+- Stream the model output directly to the terminal.
 
-        <h3>Embed and index the chunks (vector database)</h3>
-        <ul>
-          <li>Generate an embedding vector for each chunk using an Ollama embedding model (e.g., <code>nomic-embed-text</code>).</li>
-          <li>L2-normalize embeddings so cosine similarity is efficient.</li>
-          <li>Persist <code>{chunks, embeddings, metadata}</code> locally (pickle) as an on-disk vector index.</li>
-        </ul>
+---
 
-        <h3>Query-time retrieval</h3>
-        <p>Take the user question and generate its embedding. Compute cosine similarity between the query embedding and all chunk embeddings. Select the top-K most similar chunks as the retrieved context.</p>
+### 6) Operational Behavior
+- Reuse the saved index on subsequent runs if the source file and settings haven’t changed  
+  (checked via `mtime`, file size, model name, and chunk parameters).
+- Rebuild embeddings and index only when the source data or configuration changes.
 
-        <h3>Answer generation (grounded response)</h3>
-        <p>Construct a system prompt instructing the chatbot to use only the retrieved chunks. Call an Ollama chat model (e.g., <code>llama3.2</code>) with:</p>
-        <ul>
-          <li><strong>system message</strong> = retrieved context + grounding rule</li>
-          <li><strong>user message</strong> = the question</li>
-        </ul>
-        <p>Stream the model output to the terminal.</p>
+---
 
-        <h3>Operational behavior</h3>
-        <ul>
-          <li>Reuse the saved index on subsequent runs if the source file and settings haven’t changed (mtime/size/model/params match).</li>
-          <li>Rebuild embeddings and index only when the source data or configuration changes.</li>
-        </ul>
-      </section>
+## Limitations & Improvements
 
-      <section>
-        <h2>Limitations</h2>
-        <ul>
-          <li>If the question covers multiple topics at the same time, the system may not provide a good answer because the retriever selects chunks based only on similarity to the query without deeper query decomposition.</li>
-          <li>Possible solutions:
-            <ul>
-              <li>Have the chatbot write its own focused queries based on the user's input, then retrieve using those queries.</li>
-              <li>Use multiple queries to retrieve more relevant information.</li>
-            </ul>
-          </li>
-          <li>The top-N results are returned based on cosine similarity — this may not always give the best results. A reranking model can help re-rank retrieved chunks by relevance.</li>
-          <li>The database is currently stored in memory which may not scale for very large datasets. Consider more efficient vector DBs (Qdrant, Pinecone, pgvector).</li>
-        </ul>
-      </section>
+### Limitation 1 — Multi-topic questions may under-retrieve
+If a query spans multiple topics, similarity retrieval may not surface all relevant chunks because it ranks results based on a single embedding query.
 
-      <section>
-        <h2>Appendix — Chunking Methodology</h2>
-        <p>This project converts raw text into retrieval-ready chunks using a blocks → chunks approach with overlap. The goal is to preserve semantic meaning (don’t split facts), keep chunk sizes consistent (better embeddings), and reduce boundary issues (context isn’t lost between chunks).</p>
+**Potential improvements**
+- Query rewriting: have the chatbot generate a better search query from user input
+- Multi-query retrieval: generate multiple sub-queries and merge results
 
-        <h3>1) Split text into blocks (atomic units)</h3>
-        <p>Before chunking, the text is split into blocks—units that should stay intact whenever possible. The pipeline auto-detects the file structure:</p>
-        <ul>
-          <li><strong>Line-based blocks (one fact per line)</strong><br>
-            Used when the file contains very few blank lines. Each non-empty line becomes one block. Example: each line = one fact.
-          </li>
-          <li><strong>Paragraph-based blocks (blank-line separated)</strong><br>
-            Used when the file uses blank lines to separate items. Each paragraph becomes one block. Multi-line facts remain together.</li>
-        </ul>
-        <p>All blocks are cleaned (trimmed, empty blocks removed, whitespace normalized) to improve embedding stability.</p>
+---
 
-        <h3>2) Pack blocks into fixed-size chunks (greedy packing)</h3>
-        <p>Blocks are combined into chunks using a target word budget:</p>
-        <ul>
-          <li><code>MAX_WORDS</code> (e.g., 200): maximum approximate chunk size in words</li>
-        </ul>
-        <p>Algorithm (greedy packing):</p>
-        <ol>
-          <li>Start a new chunk.</li>
-          <li>Append blocks sequentially until adding the next block would exceed <code>MAX_WORDS</code>.</li>
-          <li>Finalize the current chunk and start the next one.</li>
-        </ol>
-        <p>This is greedy (simple, fast) and preserves the original ordering of the source content.</p>
+### Limitation 2 — Top-K by cosine similarity isn’t always best
+Cosine similarity ranking may return chunks that are close semantically but not maximally relevant, especially when each chunk contains many facts.
 
-        <h3>3) Add overlap to preserve context across chunk boundaries</h3>
-        <p>To reduce boundary loss, consecutive chunks share trailing context:</p>
-        <ul>
-          <li><code>OVERLAP_WORDS</code> (e.g., 40): number of words copied from the end of the previous chunk into the start of the next chunk.</li>
-        </ul>
-        <p>Why this helps: If important information lands near a chunk boundary, overlap increases the chance that at least one retrieved chunk contains the complete context needed to answer a question.</p>
-        <p>Trade-off: Overlap introduces duplication across chunks — keep it moderate (~10–25% of <code>MAX_WORDS</code>).</p>
+**Potential improvements**
+- Add a **reranking model** to reorder retrieved chunks by direct relevance to the query
 
-        <h3>4) Handle oversized blocks</h3>
-        <p>If a single block exceeds <code>MAX_WORDS</code> (e.g., one very long paragraph), it is split into multiple chunks using the same overlap rule. This ensures:</p>
-        <ul>
-          <li>No chunk becomes excessively large.</li>
-          <li>No content is dropped.</li>
-        </ul>
+---
 
-        <h3>Output</h3>
-        <p>The chunking stage produces a list of chunk strings that are:</p>
-        <ul>
-          <li>Semantically coherent (facts/paragraphs kept intact when possible)</li>
-          <li>Size-controlled (roughly uniform word counts)</li>
-          <li>Boundary-robust (overlap preserves continuity)</li>
-        </ul>
-        <p>These chunks are then embedded and indexed for similarity-based retrieval in the RAG pipeline.</p>
-      </section>
+### Limitation 3 — Not scalable for large datasets
+The current setup loads and searches embeddings in memory.
 
-      <section>
-        <h2>Example: Packing & Overlap (conceptual)</h2>
-        <div class="example">
-          <p>Given a sequence of paragraph-blocks, pack them into ~200-word chunks, and include the last ~40 words as overlap into the next chunk. If one paragraph is 500 words, split it into 3 chunks with overlaps between them.</p>
-        </div>
-      </section>
+**Potential improvements**
+- Use a production-grade vector database such as:
+  - Qdrant
+  - Pinecone
+  - pgvector (Postgres)
 
-      <footer>
-        <p>Generated: 2026-01-04</p>
-        <p>Author: Adrian Darmali</p>
-      </footer>
-    </main>
-  </div>
-</body>
-</html>
+---
+
+## Appendix: Chunking Methodology
+
+This project converts raw text into retrieval-ready chunks using a **blocks → chunks** approach with **overlap**.
+
+Goals:
+- Preserve semantic meaning (don’t split facts)
+- Keep chunk sizes consistent (better embeddings)
+- Reduce boundary loss (context preserved across chunks)
+
+---
+
+### 1) Split Text into Blocks (Atomic Units)
+The pipeline auto-detects file structure:
+
+#### Line-based blocks (one fact per line)
+- Used when the file contains very few blank lines.
+- Each non-empty line becomes one block.
+- Example: each line = one fact.
+
+#### Paragraph-based blocks (blank-line separated)
+- Used when the file uses blank lines to separate items.
+- Each paragraph becomes one block.
+- Multi-line facts remain together.
+
+All blocks are cleaned:
+- Trimmed
+- Empty blocks removed
+- Whitespace normalized
+
+---
+
+### 2) Pack Blocks into Fixed-Size Chunks (Greedy Packing)
+Blocks are combined into chunks using a target word budget:
+
+- `MAX_WORDS` (e.g., 200): maximum approximate chunk size in words
+
+Algorithm:
+1. Start a new chunk  
+2. Append blocks sequentially until adding the next block would exceed `MAX_WORDS`  
+3. Finalize the current chunk and start the next one  
+
+Why greedy packing:
+- Simple and fast
+- Preserves original ordering
+- Works well for short factual datasets
+
+---
+
+### 3) Add Overlap Between Chunks
+To reduce boundary loss:
+
+- `OVERLAP_WORDS` (e.g., 40): number of words copied from the end of the previous chunk into the next chunk
+
+Why overlap helps:
+- If key information lands near a boundary, overlap increases the chance that at least one retrieved chunk contains full context.
+
+Trade-off:
+- Overlap introduces duplication, so it should be moderate (~10–25% of `MAX_WORDS`).
+
+---
+
+### 4) Handle Oversized Blocks
+If a single block exceeds `MAX_WORDS`, it is split into multiple chunks with overlap so that:
+- no chunk becomes excessively large
+- no content is dropped
+
+---
+
+### Output
+The chunking stage produces a list of chunks that are:
+- **Semantically coherent**
+- **Size-controlled**
+- **Boundary-robust**
+
+These chunks are then embedded and indexed for similarity-based retrieval in the RAG pipeline.
