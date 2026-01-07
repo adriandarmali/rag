@@ -2,6 +2,11 @@
 
 This project is a local **Retrieval-Augmented Generation (RAG)** chatbot. It uses a **Hybrid Search** approach, combining semantic (vector) search and lexical (keyword) search, fused together using the **Reciprocal Rank Fusion (RRF)** algorithm for maximum accuracy.
 
+## Overview of Simple RAG Flow
+
+<img width="190" height="319" alt="image" src="https://github.com/user-attachments/assets/0879e8d1-6ae9-45cc-998f-e169eede6d23" />
+
+
 ## 🚀 Features
 
 * **Dual-Engine Retrieval:** Combines the "meaning" of your query (Embeddings) with "exact match" keywords (BM25).
